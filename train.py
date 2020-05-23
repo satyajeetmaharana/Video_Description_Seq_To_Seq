@@ -10,7 +10,7 @@ import torch.optim as optim
 from torch.nn.utils import clip_grad_value_
 from dataloader import VideoDataset
 from misc.rewards import get_self_critical_reward, init_cider_scorer
-from models import DecoderRNN, EncoderRNN, S2VTAttModel, S2VTModel
+from models import DecoderRNN, EncoderRNN, EncoderDecoderModel
 from torch import nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -23,32 +23,15 @@ def train(loader, model, crit, optimizer, lr_scheduler, opt, rl_crit=None):
     #model = nn.DataParallel(model, device_ids=[0, 1, 2])
     for epoch in tqdm(range(opt["epochs"])):
         iteration = 0
-        # If start self crit training
-        if opt["self_crit_after"] != -1 and epoch >= opt["self_crit_after"]:
-            sc_flag = True
-            init_cider_scorer(opt["cached_tokens"])
-        else:
-            sc_flag = False
         model.train()
         for data in loader:
             torch.cuda.synchronize()
             fc_feats = data['fc_feats'].squeeze(dim=1).cuda()
             labels = data['labels'].cuda()
             masks = data['masks'].cuda()
-
             optimizer.zero_grad()
-            if not sc_flag:
-                seq_probs, _ = model(fc_feats, labels, 'train')
-                loss = crit(seq_probs, labels[:, 1:], masks[:, 1:])
-            else:
-                seq_probs, seq_preds = model(
-                    fc_feats, mode='inference', opt=opt)
-                reward = get_self_critical_reward(model, fc_feats, data,
-                                                  seq_preds)
-                print(reward.shape)
-                loss = rl_crit(seq_probs, seq_preds,
-                               torch.from_numpy(reward).float().cuda())
-
+            seq_probs, _ = model(fc_feats, labels, 'train')
+            loss = crit(seq_probs, labels[:, 1:], masks[:, 1:])
             loss.backward()
             clip_grad_value_(model.parameters(), opt['grad_clip'])
             optimizer.step()
@@ -56,13 +39,8 @@ def train(loader, model, crit, optimizer, lr_scheduler, opt, rl_crit=None):
             torch.cuda.synchronize()
             lr_scheduler.step()
             iteration += 1
-            
-            if not sc_flag and iteration % 15 == 0:
-                print("\n iter %d (epoch %d), train_loss = %.6f" %
-                      (iteration, epoch, train_loss))
-            elif sc_flag:
-                print("\n iter %d (epoch %d), avg_reward = %.6f" %
-                      (iteration, epoch, np.mean(reward[:, 0])))
+            if iteration % 15 == 0:
+                print("\n iter %d (epoch %d), train_loss = %.6f" %(iteration, epoch, train_loss))
         val_loss = 0
         model.eval()
         for val_data in dataloader_val:
@@ -75,14 +53,11 @@ def train(loader, model, crit, optimizer, lr_scheduler, opt, rl_crit=None):
             val_loss += loss.item()
             torch.cuda.synchronize()
             
-        print("\n(epoch %d), val_loss = %.6f" %
-              (epoch, val_loss))
+        print("\n(epoch %d), val_loss = %.6f" %(epoch, val_loss))
         
-        if epoch % opt["save_checkpoint_every"] == 0:
-            model_path = os.path.join(opt["checkpoint_path"],
-                                      'model_%d.pth' % (epoch))
-            model_info_path = os.path.join(opt["checkpoint_path"],
-                                           'model_score.txt')
+        if epoch % 50 == 0:
+            model_path = os.path.join(opt["checkpoint_path"],'model_%d.pth' % (epoch))
+            model_info_path = os.path.join(opt["checkpoint_path"],'model_score.txt')
             torch.save(model.state_dict(), model_path)
             print("model saved to %s" % (model_path))
             with open(model_info_path, 'a') as f:
@@ -97,47 +72,29 @@ def main(opt):
     dataset_val =  VideoDataset(opt, 'val')
     dataloader_val = DataLoader(dataset_val, batch_size=opt["batch_size"], shuffle=True, num_workers=0, pin_memory=True)
     opt["vocab_size"] = dataset.get_vocab_size()
-    if opt["model"] == 'S2VTModel':
-        model = S2VTModel(
-            opt["vocab_size"],
-            opt["max_len"],
-            opt["dim_hidden"],
-            opt["dim_word"],
-            opt['dim_vid'],
-            rnn_cell=opt['rnn_type'],
-            n_layers=opt['num_layers'],
-            rnn_dropout_p=opt["rnn_dropout_p"])
-    elif opt["model"] == "S2VTAttModel":
-        encoder = EncoderRNN(
-            opt["dim_vid"],
-            opt["dim_hidden"],
-            bidirectional=bool(opt["bidirectional"]),
-            input_dropout_p=opt["input_dropout_p"],
-            rnn_cell=opt['rnn_type'],
-            rnn_dropout_p=opt["rnn_dropout_p"])
-        decoder = DecoderRNN(
-            opt["vocab_size"],
-            opt["max_len"],
-            opt["dim_hidden"],
-            opt["dim_word"],
-            input_dropout_p=opt["input_dropout_p"],
-            rnn_cell=opt['rnn_type'],
-            rnn_dropout_p=opt["rnn_dropout_p"],
-            bidirectional=bool(opt["bidirectional"]))
-        model = S2VTAttModel(encoder, decoder)
+    encoder = EncoderRNN(
+        opt["dim_vid"],
+        opt["dim_hidden"],
+        bidirectional=bool(opt["bidirectional"]),
+        input_dropout_p=opt["input_dropout_p"],
+        rnn_cell=opt['rnn_type'],
+        rnn_dropout_p=opt["rnn_dropout_p"])
+    decoder = DecoderRNN(
+        opt["vocab_size"],
+        opt["max_len"],
+        opt["dim_hidden"],
+        opt["dim_word"],
+        input_dropout_p=opt["input_dropout_p"],
+        rnn_cell=opt['rnn_type'],
+        rnn_dropout_p=opt["rnn_dropout_p"],
+        bidirectional=bool(opt["bidirectional"]))
+    model = EncoderDecoderModel(encoder, decoder)
     model = model.cuda()
-    #model = nn.DataParallel(model)
-    #model.load_state_dict(torch.load('data/save_vatex_batch_noc3d/model_500.pth'))
+    model = nn.DataParallel(model)
+    model.load_state_dict(torch.load('data/save_vatex_batch_noc3d/model_500.pth'))
     crit = utils.LanguageModelCriterion()
-    rl_crit = utils.RewardCriterion()
-    optimizer = optim.Adam(
-        model.parameters(),
-        lr=opt["learning_rate"],
-        weight_decay=opt["weight_decay"])
-    exp_lr_scheduler = optim.lr_scheduler.StepLR(
-        optimizer,
-        step_size=opt["learning_rate_decay_every"],
-        gamma=opt["learning_rate_decay_rate"])
+    optimizer = optim.Adam(model.parameters(),lr=opt["learning_rate"],weight_decay=opt["weight_decay"])
+    exp_lr_scheduler = optim.lr_scheduler.StepLR(optimizer,step_size=opt["learning_rate_decay_every"],gamma=opt["learning_rate_decay_rate"])
     print("Data Loaded")
     train(dataloader, model, crit, optimizer, exp_lr_scheduler, opt, rl_crit)
 

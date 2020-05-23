@@ -77,19 +77,10 @@ def main(params):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-
-    # input json
-    parser.add_argument('--input_json', type=str, default='data/videodatainfo_2017.json',
-                        help='msr_vtt videoinfo json')
-    parser.add_argument('--info_json', default='data/info.json',
-                        help='info about iw2word and word2ix')
-    parser.add_argument('--caption_json', default='data/caption.json', help='caption json file')
-
-
-    parser.add_argument('--word_count_threshold', default=1, type=int,
-                        help='only words that occur more than this number of times will be put in vocab')
-
-
+    parser.add_argument('--input_json', type=str, default='data/videodatainfo_2017.json')
+    parser.add_argument('--info_json', default='data/info.json')
+    parser.add_argument('--caption_json', default='data/caption.json')
+    parser.add_argument('--word_count_threshold', default=1, type=int)
     args = parser.parse_args()
-    params = vars(args)  # convert to ordinary dict
+    params = vars(args)
     main(params)
